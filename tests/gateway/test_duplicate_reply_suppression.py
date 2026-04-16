@@ -352,3 +352,176 @@ class TestQueuedMessageAlreadyStreamed:
         )
 
         assert _already_streamed is False
+
+
+# ===================================================================
+# Test 3: run.py — interim messages with tool calls (#10942)
+# ===================================================================
+
+
+class TestInterimMessagesWithToolCalls:
+    """When interim_assistant_messages is enabled, the stream consumer may
+    send a short interim message (e.g. 'Let me check that skill.') before
+    tool calls. The final response after tool calls is NEW content that
+    must be delivered — not suppressed by already_sent=True from the interim.
+
+    Bug #10942: The user only sees the interim message and the tool-call
+    notification, but the actual answer (final response) is silently dropped.
+    """
+
+    def _make_mock_stream_consumer(self, already_sent=False, final_response_sent=False):
+        return SimpleNamespace(
+            already_sent=already_sent,
+            final_response_sent=final_response_sent,
+        )
+
+    def _apply_suppression_logic(self, response, sc):
+        """Reproduce the fixed logic from gateway/run.py return path (#10942)."""
+        if sc and isinstance(response, dict) and not response.get("failed"):
+            _final = response.get("final_response") or ""
+            _is_empty_sentinel = not _final or _final == "(empty)"
+            _final_was_streamed = getattr(sc, "final_response_sent", False)
+            _something_was_sent = getattr(sc, "already_sent", False)
+            _previewed = bool(response.get("response_previewed"))
+            _msgs = response.get("messages") or []
+            _had_tool_calls = any(
+                m.get("role") == "tool" or m.get("tool_calls")
+                for m in _msgs
+            )
+            _should_suppress = (
+                not _is_empty_sentinel
+                and (
+                    _final_was_streamed
+                    or _previewed
+                    or (_something_was_sent and not _had_tool_calls)
+                )
+            )
+            if _should_suppress:
+                response["already_sent"] = True
+
+    def test_interim_sent_with_tool_calls_not_suppressed(self):
+        """When interim message was sent (already_sent=True) but there were
+        tool calls, the final response is NEW content and must NOT be
+        suppressed."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=False)
+        response = {
+            "final_response": "Here is the full documentation for that skill...",
+            "messages": [
+                {"role": "user", "content": "Show me the using-superpowers skill"},
+                {"role": "assistant", "content": "Let me check that skill.", "tool_calls": [{"id": "1", "function": {"name": "skill_view"}}]},
+                {"role": "tool", "content": "# using-superpowers\n...", "tool_call_id": "1"},
+                {"role": "assistant", "content": "Here is the full documentation for that skill..."},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert "already_sent" not in response, (
+            "Final response should NOT be suppressed when tool calls were made"
+        )
+
+    def test_interim_sent_without_tool_calls_suppressed(self):
+        """When something was sent and there were NO tool calls, the response
+        should still be suppressed (existing behavior)."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=False)
+        response = {
+            "final_response": "Here is a simple answer.",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Here is a simple answer."},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert response.get("already_sent") is True
+
+    def test_final_streamed_still_suppressed_with_tool_calls(self):
+        """If the final response itself was streamed (final_response_sent=True),
+        it should still be suppressed even if there were tool calls."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=True)
+        response = {
+            "final_response": "Final answer after tools",
+            "messages": [
+                {"role": "user", "content": "Run a command"},
+                {"role": "assistant", "tool_calls": [{"id": "1", "function": {"name": "terminal"}}]},
+                {"role": "tool", "content": "output", "tool_call_id": "1"},
+                {"role": "assistant", "content": "Final answer after tools"},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert response.get("already_sent") is True, (
+            "Should suppress when final_response_sent=True even with tool calls"
+        )
+
+    def test_response_previewed_still_suppressed_with_tool_calls(self):
+        """If response_previewed is True, suppress even with tool calls
+        (the full text was already sent via the non-streaming interim path)."""
+        sc = self._make_mock_stream_consumer(already_sent=False, final_response_sent=False)
+        response = {
+            "final_response": "Previewed response",
+            "response_previewed": True,
+            "messages": [
+                {"role": "user", "content": "Do something"},
+                {"role": "assistant", "tool_calls": [{"id": "1", "function": {"name": "web_fetch"}}]},
+                {"role": "tool", "content": "data", "tool_call_id": "1"},
+                {"role": "assistant", "content": "Previewed response"},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert response.get("already_sent") is True
+
+    def test_empty_response_with_tool_calls_not_suppressed(self):
+        """Empty sentinel should never be suppressed, regardless of tool calls."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=False)
+        response = {
+            "final_response": "(empty)",
+            "messages": [
+                {"role": "user", "content": "Search something"},
+                {"role": "assistant", "tool_calls": [{"id": "1", "function": {"name": "web_search"}}]},
+                {"role": "tool", "content": "results", "tool_call_id": "1"},
+                {"role": "assistant", "content": "(empty)"},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert "already_sent" not in response
+
+    def test_failed_response_with_tool_calls_not_suppressed(self):
+        """Failed responses should never be suppressed."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=True)
+        response = {
+            "final_response": "Error: tool failed",
+            "failed": True,
+            "messages": [
+                {"role": "user", "content": "Run command"},
+                {"role": "assistant", "tool_calls": [{"id": "1", "function": {"name": "terminal"}}]},
+                {"role": "tool", "content": "error", "tool_call_id": "1"},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert "already_sent" not in response
+
+    def test_tool_role_message_detected(self):
+        """Messages with role='tool' should be detected as tool calls."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=False)
+        response = {
+            "final_response": "Analysis complete",
+            "messages": [
+                {"role": "user", "content": "Analyze"},
+                {"role": "assistant", "content": "Analyzing..."},
+                {"role": "tool", "content": "result"},
+                {"role": "assistant", "content": "Analysis complete"},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert "already_sent" not in response
+
+    def test_tool_calls_in_assistant_message_detected(self):
+        """Assistant messages with tool_calls key should be detected."""
+        sc = self._make_mock_stream_consumer(already_sent=True, final_response_sent=False)
+        response = {
+            "final_response": "Done",
+            "messages": [
+                {"role": "user", "content": "Run"},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "x", "function": {"name": "test"}}]},
+                {"role": "assistant", "content": "Done"},
+            ],
+        }
+        self._apply_suppression_logic(response, sc)
+        assert "already_sent" not in response

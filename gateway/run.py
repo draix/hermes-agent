@@ -9515,18 +9515,47 @@ class GatewayRunner:
         # tool call, setting already_sent=True, but that text is NOT the
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
+        #
+        # Never suppress when there were tool calls in the turn AND
+        # interim_assistant_messages is enabled — the interim text (e.g.
+        # "Let me check that skill.") was delivered mid-turn, but the final
+        # response is NEW content produced after the tool calls completed.
+        # Suppressing it would leave the user without the actual answer.
+        # (#10942 — "interim_assistant_messages drops final response")
         _sc = stream_consumer_holder[0]
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"
-            _streamed = _sc and (
-                getattr(_sc, "final_response_sent", False)
-                or getattr(_sc, "already_sent", False)
-            )
+            _final_was_streamed = _sc and getattr(_sc, "final_response_sent", False)
+            _something_was_sent = _sc and getattr(_sc, "already_sent", False)
             # response_previewed means the interim_assistant_callback already
             # sent the final text via the adapter (non-streaming path).
             _previewed = bool(response.get("response_previewed"))
-            if not _is_empty_sentinel and (_streamed or _previewed):
+            # Check if there were tool calls in this turn — if so, the final
+            # response is post-tool content that should not be suppressed even
+            # if interim text was already streamed/sent.
+            _msgs = response.get("messages") or []
+            _had_tool_calls = any(
+                m.get("role") == "tool" or m.get("tool_calls")
+                for m in _msgs
+            )
+            # Suppress the final send if:
+            # 1. Response is not empty/sentinel, AND
+            # 2. One of:
+            #    a) The final response itself was already streamed, OR
+            #    b) Response was previewed (non-streaming interim path), OR
+            #    c) Something was sent AND there were NO tool calls
+            #       (if tools ran, the final response is new post-tool content
+            #       that must be delivered even if interim text was sent earlier)
+            _should_suppress = (
+                not _is_empty_sentinel
+                and (
+                    _final_was_streamed
+                    or _previewed
+                    or (_something_was_sent and not _had_tool_calls)
+                )
+            )
+            if _should_suppress:
                 response["already_sent"] = True
         
         return response
