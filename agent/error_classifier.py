@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -49,6 +50,7 @@ class FailoverReason(enum.Enum):
 
     # Request format
     format_error = "format_error"        # 400 bad request — abort or strip + retry
+    invalid_tool_call_id = "invalid_tool_call_id"  # 400 with stale tool_call_id — purge + retry
 
     # Provider-specific
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
@@ -77,6 +79,13 @@ class ClassifiedError:
     should_compress: bool = False
     should_rotate_credential: bool = False
     should_fallback: bool = False
+
+    # When set, the retry loop should purge the assistant tool_call message
+    # whose ``id`` equals this value (and any tool_result messages tied to
+    # it) from the messages list before retrying or persisting. Used to
+    # recover from providers that reject a stale / malformed ``tool_call_id``
+    # with HTTP 400 (see issue #16472 — MiniMax `tool_call_id: ... (2013)`).
+    purge_tool_call_id: Optional[str] = None
 
     @property
     def is_auth(self) -> bool:
@@ -138,6 +147,39 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "periodic",
     "window",
 ]
+
+# Patterns that signal a stale / malformed ``tool_call_id`` was rejected by
+# the provider with HTTP 400. Hermes carries tool_call_ids across messages
+# in the SQLite session log; once a provider rejects one (e.g. MiniMax's
+# `invalid function arguments json string, tool_call_id: call_function_X (2013)`)
+# any subsequent session that inherits the same conversation history will
+# keep replaying the same broken assistant turn. Detecting this lets the
+# retry loop purge the offending assistant tool_call before persisting.
+_INVALID_TOOL_CALL_ID_PATTERNS = [
+    "tool_call_id",
+    "invalid function arguments",
+    "invalid params, invalid function arguments",
+    "unknown tool_call_id",
+    "no tool call with id",
+    "tool_call_id not found",
+]
+
+# Compiled extractor for the offending id. Matches OpenAI / MiniMax style
+# tokens emitted in 400 error messages, e.g.::
+#
+#     tool_call_id: call_function_18464z1gskgy_1
+#     tool_call_id call_abc_123
+#     'tool_call_id': 'call_xyz'
+#     no tool call with id call_xyz_42 found
+#
+# The pattern is intentionally loose on punctuation/quoting/separators
+# because each provider phrases the body slightly differently. Returns
+# None when no id can be extracted (caller falls back to the generic
+# format_error path).
+_TOOL_CALL_ID_TOKEN = re.compile(
+    r"tool[_\-\s]*call[_\-\s]*(?:with[_\-\s]+)?id\s*[:=]?\s*['\"]?(?P<id>[A-Za-z0-9_-]{4,256})['\"]?",
+    re.IGNORECASE,
+)
 
 # Payload-too-large patterns detected from message text (no status_code attr).
 # Proxies and some backends embed the HTTP status in the error message.
@@ -391,6 +433,13 @@ def classify_api_error(
     if _metadata_msg and _metadata_msg not in _raw_msg and _metadata_msg not in _body_msg:
         parts.append(_metadata_msg)
     error_msg = " ".join(parts)
+    # Case-preserved companion used by extractors that need original
+    # casing (e.g. ``tool_call_id`` is case-sensitive on the wire).
+    _cased_parts = [str(error)]
+    _cased_companion = _build_cased_error_msg(body)
+    if _cased_companion and _cased_companion not in _cased_parts[0]:
+        _cased_parts.append(_cased_companion)
+    error_msg_cased = " ".join(p for p in _cased_parts if p)
     provider_lower = (provider or "").strip().lower()
     model_lower = (model or "").strip().lower()
 
@@ -443,6 +492,7 @@ def classify_api_error(
             approx_tokens=approx_tokens, context_length=context_length,
             num_messages=num_messages,
             result_fn=_result,
+            error_msg_cased=error_msg_cased,
         )
         if classified is not None:
             return classified
@@ -517,6 +567,7 @@ def _classify_by_status(
     context_length: int,
     num_messages: int = 0,
     result_fn,
+    error_msg_cased: str = "",
 ) -> Optional[ClassifiedError]:
     """Classify based on HTTP status code with message-aware refinement."""
 
@@ -605,6 +656,7 @@ def _classify_by_status(
             context_length=context_length,
             num_messages=num_messages,
             result_fn=result_fn,
+            error_msg_cased=error_msg_cased,
         )
 
     if status_code in (500, 502):
@@ -657,6 +709,54 @@ def _classify_402(error_msg: str, result_fn) -> ClassifiedError:
     )
 
 
+def _build_cased_error_msg(body: Any) -> str:
+    """Reconstruct a case-preserved error message from a parsed body.
+
+    The main pattern-matching pipeline lowercases everything to keep
+    pattern lists short, but a few fields (notably ``tool_call_id``) are
+    case-sensitive on the wire. This helper recovers the original casing
+    from the structured body when available; callers fall back to the
+    lowercased ``error_msg`` if the result is empty.
+    """
+    parts: list[str] = []
+    if isinstance(body, dict):
+        err_obj = body.get("error", {})
+        if isinstance(err_obj, dict):
+            cased_body = str(err_obj.get("message") or "")
+            if cased_body:
+                parts.append(cased_body)
+        cased_top = str(body.get("message") or "")
+        if cased_top and cased_top not in parts:
+            parts.append(cased_top)
+    return " ".join(parts)
+
+
+def extract_invalid_tool_call_id(error_msg: str) -> Optional[str]:
+    """Best-effort extraction of the offending ``tool_call_id`` from a 400.
+
+    Returns ``None`` when no plausible id token is found. Pass the raw
+    (case-preserved) error string when possible — most providers emit
+    case-sensitive ids and the lowercased form used for pattern matching
+    elsewhere in this module would fail to match the persisted id.
+
+    The caller is expected to first verify that the error matches
+    :data:`_INVALID_TOOL_CALL_ID_PATTERNS` so a generic 400 mentioning
+    ``tool_call_id`` in passing isn't misclassified.
+    """
+    if not error_msg:
+        return None
+    match = _TOOL_CALL_ID_TOKEN.search(error_msg)
+    if not match:
+        return None
+    candidate = match.group("id")
+    # Sanity-check: drop obvious noise tokens captured by the regex when the
+    # provider phrases the message awkwardly (e.g. "the tool_call_id field").
+    lowered = candidate.lower()
+    if lowered in {"field", "value", "missing", "present", "required"}:
+        return None
+    return candidate
+
+
 def _classify_400(
     error_msg: str,
     error_code: str,
@@ -668,8 +768,25 @@ def _classify_400(
     context_length: int,
     num_messages: int = 0,
     result_fn,
+    error_msg_cased: str = "",
 ) -> ClassifiedError:
     """Classify 400 Bad Request — context overflow, format error, or generic."""
+
+    # Stale / malformed tool_call_id rejected by the provider. Detect this
+    # before falling through to the generic format_error path so the retry
+    # loop can purge the offending assistant tool_call from the messages
+    # list and avoid persisting it into state.db (issue #16472).
+    if any(p in error_msg for p in _INVALID_TOOL_CALL_ID_PATTERNS):
+        # Prefer the case-preserved string for extraction — ids are
+        # case-sensitive but error_msg has been lowercased upstream.
+        purge_id = extract_invalid_tool_call_id(error_msg_cased or error_msg)
+        if purge_id:
+            return result_fn(
+                FailoverReason.invalid_tool_call_id,
+                retryable=True,
+                should_fallback=False,
+                purge_tool_call_id=purge_id,
+            )
 
     # Context overflow from 400
     if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):

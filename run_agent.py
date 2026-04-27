@@ -4724,6 +4724,77 @@ class AIAgent:
         return messages
 
     @staticmethod
+    def _purge_invalid_tool_call_id(
+        messages: List[Dict[str, Any]],
+        invalid_id: str,
+    ) -> int:
+        """Strip a stale ``tool_call_id`` from the message list in-place.
+
+        Walks ``messages`` and:
+
+        * Drops the matching ``tool_call`` entry from every ``assistant`` /
+          ``function`` message; if that empties the call list and the
+          message has no textual content, the whole message is dropped.
+        * Drops every ``role=='tool'`` message keyed to that id.
+
+        Returns the number of (message, call) sites that were touched. Used
+        by the retry loop on HTTP 400 errors that name a specific id (see
+        :class:`agent.error_classifier.ClassifiedError.purge_tool_call_id`
+        — issue #16472). Mutates ``messages`` in place; the caller should
+        re-assign the slot when needed.
+        """
+        if not invalid_id or not messages:
+            return 0
+
+        touched = 0
+        cleaned: List[Dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "tool" and msg.get("tool_call_id") == invalid_id:
+                touched += 1
+                continue  # Drop the matching tool_result.
+
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                kept_calls = []
+                for tc in tool_calls:
+                    cid = AIAgent._get_tool_call_id_static(tc)
+                    if cid == invalid_id:
+                        touched += 1
+                        continue
+                    kept_calls.append(tc)
+                if len(kept_calls) != len(tool_calls):
+                    if kept_calls:
+                        # Mutate carefully — some message implementations
+                        # are dataclass-like, so prefer dict assignment.
+                        if isinstance(msg, dict):
+                            msg["tool_calls"] = kept_calls
+                        else:
+                            try:
+                                msg.tool_calls = kept_calls  # type: ignore[attr-defined]
+                            except Exception:
+                                # If the object is immutable, drop it whole
+                                # rather than keeping a stale call list.
+                                continue
+                    else:
+                        # All tool_calls on this message were the bad id.
+                        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+                        if not content:
+                            continue  # Drop the now-empty assistant turn.
+                        if isinstance(msg, dict):
+                            msg["tool_calls"] = []
+                        else:
+                            try:
+                                msg.tool_calls = []  # type: ignore[attr-defined]
+                            except Exception:
+                                continue
+            cleaned.append(msg)
+
+        if touched:
+            messages[:] = cleaned
+        return touched
+
+    @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
         """Truncate excess delegate_task calls to max_concurrent_children.
 
@@ -10812,6 +10883,47 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
+
+                    # ── Stale tool_call_id rejected by provider (#16472) ──
+                    # MiniMax (and other providers) can 400 a request when an
+                    # assistant message in the history names a tool_call_id
+                    # the provider no longer recognises. Without intervention
+                    # we'd persist the broken assistant turn into state.db,
+                    # and every subsequent session inheriting the same
+                    # conversation_history would hit the same 400. Purge the
+                    # offending tool_call (and its paired tool_result, if
+                    # any) and retry without counting against retry_count.
+                    if (
+                        classified.reason == FailoverReason.invalid_tool_call_id
+                        and classified.purge_tool_call_id
+                    ):
+                        purged = self._purge_invalid_tool_call_id(
+                            messages, classified.purge_tool_call_id
+                        )
+                        # Also clean up the api_messages snapshot so this
+                        # retry doesn't re-send the same broken payload.
+                        if api_messages:
+                            self._purge_invalid_tool_call_id(
+                                api_messages, classified.purge_tool_call_id
+                            )
+                        if purged:
+                            self._vprint(
+                                f"{self.log_prefix}⚠️  Provider rejected "
+                                f"tool_call_id={classified.purge_tool_call_id!r}; "
+                                f"purged {purged} stale entr{'y' if purged == 1 else 'ies'} "
+                                f"from history and retrying.",
+                                force=True,
+                            )
+                            # Persist the cleaned history immediately so a
+                            # crash-restart cannot resurrect the bad id.
+                            try:
+                                self._persist_session(messages, conversation_history)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to persist session after purging invalid tool_call_id"
+                                )
+                            continue
+
                     if (
                         self.api_mode == "codex_responses"
                         and self.provider == "openai-codex"

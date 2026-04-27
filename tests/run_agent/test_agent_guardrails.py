@@ -263,3 +263,110 @@ class TestGetToolCallIdStatic:
     def test_object_without_id_attr(self):
         tc = types.SimpleNamespace()
         assert AIAgent._get_tool_call_id_static(tc) == ""
+
+
+# ---------------------------------------------------------------------------
+# _purge_invalid_tool_call_id (issue #16472)
+# ---------------------------------------------------------------------------
+
+class TestPurgeInvalidToolCallId:
+
+    def _assistant(self, *, tool_calls=None, content=""):
+        msg = {"role": "assistant", "content": content}
+        if tool_calls is not None:
+            msg["tool_calls"] = tool_calls
+        return msg
+
+    def _tool_result(self, tool_call_id, content="result"):
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+    def test_drops_matching_tool_result_message(self):
+        messages = [
+            self._assistant(tool_calls=[{"id": "good_1", "function": {"name": "f", "arguments": "{}"}}]),
+            self._tool_result("good_1", "ok"),
+            self._tool_result("bad_99", "stale"),
+        ]
+        touched = AIAgent._purge_invalid_tool_call_id(messages, "bad_99")
+        assert touched == 1
+        ids_left = [m.get("tool_call_id") for m in messages if m.get("role") == "tool"]
+        assert "bad_99" not in ids_left
+        assert "good_1" in ids_left
+
+    def test_strips_only_the_bad_call_when_assistant_has_multiple(self):
+        messages = [
+            self._assistant(tool_calls=[
+                {"id": "bad_99", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "good_1", "function": {"name": "g", "arguments": "{}"}},
+            ], content="reasoning"),
+            self._tool_result("good_1", "ok"),
+        ]
+        touched = AIAgent._purge_invalid_tool_call_id(messages, "bad_99")
+        assert touched == 1
+        # Assistant survives with the surviving call.
+        assert messages[0]["role"] == "assistant"
+        assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["good_1"]
+        # tool_result for the surviving call also survives.
+        assert messages[-1] == {"role": "tool", "tool_call_id": "good_1", "content": "ok"}
+
+    def test_drops_assistant_when_only_call_was_bad_and_no_content(self):
+        """Empty assistant turn (no content, no surviving calls) is dropped
+        outright so the next assistant message isn't preceded by a stub."""
+        messages = [
+            {"role": "user", "content": "hello"},
+            self._assistant(
+                tool_calls=[{"id": "bad_99", "function": {"name": "f", "arguments": "{}"}}],
+                content="",
+            ),
+            self._tool_result("bad_99", "stale"),
+        ]
+        touched = AIAgent._purge_invalid_tool_call_id(messages, "bad_99")
+        # 1 assistant tool_call removed + 1 tool_result removed = 2 sites
+        assert touched == 2
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+
+    def test_keeps_assistant_when_only_call_was_bad_but_has_content(self):
+        """If the assistant turn carried text alongside the bad call, keep
+        the text — losing the message would discard model-visible context."""
+        messages = [
+            self._assistant(
+                tool_calls=[{"id": "bad_99", "function": {"name": "f", "arguments": "{}"}}],
+                content="here is some reasoning",
+            ),
+            self._tool_result("bad_99", "stale"),
+        ]
+        touched = AIAgent._purge_invalid_tool_call_id(messages, "bad_99")
+        assert touched == 2
+        assert len(messages) == 1
+        assert messages[0]["content"] == "here is some reasoning"
+        assert messages[0]["tool_calls"] == []
+
+    def test_no_op_when_id_is_missing(self):
+        messages = [
+            self._assistant(tool_calls=[{"id": "good_1", "function": {"name": "f", "arguments": "{}"}}]),
+            self._tool_result("good_1", "ok"),
+        ]
+        original_len = len(messages)
+        touched = AIAgent._purge_invalid_tool_call_id(messages, "not_present_xx")
+        assert touched == 0
+        assert len(messages) == original_len
+
+    def test_handles_object_style_tool_calls(self):
+        """Some code paths build assistant messages with object-style tool
+        calls (Pydantic / SDK shapes). The purge has to mutate those too."""
+        tc_good = types.SimpleNamespace(id="good_1", function=types.SimpleNamespace(name="f", arguments="{}"))
+        tc_bad = types.SimpleNamespace(id="bad_99", function=types.SimpleNamespace(name="g", arguments="{}"))
+        messages = [
+            {"role": "assistant", "content": "x", "tool_calls": [tc_good, tc_bad]},
+            self._tool_result("bad_99"),
+            self._tool_result("good_1"),
+        ]
+        touched = AIAgent._purge_invalid_tool_call_id(messages, "bad_99")
+        assert touched == 2  # 1 tool_call entry + 1 tool_result
+        remaining_ids = [tc.id for tc in messages[0]["tool_calls"]]
+        assert remaining_ids == ["good_1"]
+
+    def test_empty_inputs_are_safe(self):
+        assert AIAgent._purge_invalid_tool_call_id([], "anything") == 0
+        assert AIAgent._purge_invalid_tool_call_id(None, "anything") == 0
+        assert AIAgent._purge_invalid_tool_call_id([{"role": "user", "content": "hi"}], "") == 0

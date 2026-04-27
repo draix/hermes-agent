@@ -56,6 +56,7 @@ class TestFailoverReason:
             "overloaded", "server_error", "timeout",
             "context_overflow", "payload_too_large",
             "model_not_found", "format_error",
+            "invalid_tool_call_id",
             "provider_policy_blocked",
             "thinking_signature", "long_context_tier", "unknown",
         }
@@ -1128,3 +1129,121 @@ class TestRateLimitErrorWithoutStatusCode:
         e.status_code = None
         result = classify_api_error(e, provider="copilot", model="gpt-4o")
         assert result.reason != FailoverReason.rate_limit
+
+
+# ── Test: invalid tool_call_id (issue #16472) ──────────────────────────
+
+class TestInvalidToolCallId:
+    """Regression tests for #16472 — MiniMax-style 400 with stale tool_call_id.
+
+    The provider rejects a tool_call_id that Hermes persisted in state.db
+    from a prior session. Without classification, the retry loop persists
+    the bad assistant turn again and every new session inheriting the
+    conversation_history hits the same 400 indefinitely.
+    """
+
+    MINIMAX_400_BODY = {
+        "type": "error",
+        "error": {
+            "type": "bad_request_error",
+            "message": (
+                "invalid params, invalid function arguments json string, "
+                "tool_call_id: call_function_18464z1gskgy_1 (2013)"
+            ),
+            "http_code": "400",
+        },
+    }
+
+    def test_minimax_invalid_tool_call_id_is_classified(self):
+        e = MockAPIError(
+            "Error code: 400 - invalid params, invalid function arguments json string, "
+            "tool_call_id: call_function_18464z1gskgy_1 (2013)",
+            status_code=400,
+            body=self.MINIMAX_400_BODY,
+        )
+        result = classify_api_error(e, provider="minimax-cn", model="MiniMax-M2.7")
+        assert result.reason == FailoverReason.invalid_tool_call_id
+        assert result.retryable is True
+        assert result.should_fallback is False
+
+    def test_purge_id_is_extracted_with_original_casing(self):
+        """The id is case-sensitive but error_msg is lowercased upstream;
+        ensure the cased version reaches the extractor (regression for the
+        early version of this fix that lost mixed-case ids)."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "error": {
+                    "message": (
+                        "invalid params, invalid function arguments json string, "
+                        "tool_call_id: call_function_BgFD4kM3qNvm_1 (2013)"
+                    ),
+                },
+            },
+        )
+        result = classify_api_error(e, provider="minimax-cn", model="MiniMax-M2.7")
+        assert result.reason == FailoverReason.invalid_tool_call_id
+        assert result.purge_tool_call_id == "call_function_BgFD4kM3qNvm_1"
+
+    def test_unrelated_400_keeps_format_error(self):
+        """A generic format-error 400 must NOT be reclassified."""
+        e = MockAPIError(
+            "Error code: 400 - parameter 'temperature' out of range",
+            status_code=400,
+            body={"error": {"message": "parameter 'temperature' out of range"}},
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-4o")
+        assert result.reason == FailoverReason.format_error
+        assert result.purge_tool_call_id is None
+
+    def test_pattern_match_without_extractable_id_falls_through(self):
+        """Pattern match alone is not enough — the id has to be extractable.
+        Otherwise a vague mention would purge nothing and we'd be stuck."""
+        e = MockAPIError(
+            "Error code: 400 - tool_call_id field missing",
+            status_code=400,
+            body={"error": {"message": "tool_call_id field missing"}},
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-4o")
+        # "field" is in the noise blocklist so extraction returns None and
+        # we fall through to format_error.
+        assert result.reason == FailoverReason.format_error
+
+    def test_openai_unknown_tool_call_id_is_classified(self):
+        """OpenAI emits the same family of error ('No tool call with id'),
+        so the same fix has to cover it."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "error": {
+                    "message": "no tool call with id call_xyz_42 found in conversation history",
+                },
+            },
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-4o")
+        assert result.reason == FailoverReason.invalid_tool_call_id
+        assert result.purge_tool_call_id == "call_xyz_42"
+
+    def test_invalid_tool_call_id_takes_priority_over_context_overflow(self):
+        """Context-overflow and invalid_tool_call_id can both look like 400s;
+        the tool_call_id branch must run first because the recovery is
+        cheaper (no compression, just purge + retry)."""
+        e = MockAPIError(
+            "Error code: 400 - tool_call_id: call_function_X_1 — also context length exceeded",
+            status_code=400,
+            body={
+                "error": {
+                    "message": (
+                        "tool_call_id: call_function_X_1 — also context length exceeded"
+                    ),
+                },
+            },
+        )
+        result = classify_api_error(
+            e, provider="minimax-cn", model="MiniMax-M2.7",
+            approx_tokens=200_000, context_length=128_000,
+        )
+        assert result.reason == FailoverReason.invalid_tool_call_id
+        assert result.purge_tool_call_id == "call_function_X_1"
