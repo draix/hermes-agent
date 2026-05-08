@@ -882,6 +882,39 @@ def _qwen_portal_headers() -> dict:
     }
 
 
+def _has_separate_reasoning(assistant_message) -> bool:
+    """Detect whether an assistant message carries reasoning in a separate
+    channel (i.e. parser-split output) rather than inline in ``content``.
+
+    When upstream providers split chain-of-thought into ``reasoning_content``
+    or ``reasoning`` (Ollama qwen3.x PARSER, DeepSeek-R1, Moonshot, Novita,
+    etc.), ``content`` may legitimately come back empty even though the model
+    produced complete reasoning. The post-tool empty-response nudge
+    (issue #21811) must skip the nudge in that case so the prefill path can
+    take over instead of triggering a wasteful retry round-trip.
+
+    Accepts any object exposing ``reasoning_content`` / ``reasoning`` as
+    attributes (OpenAI SDK pydantic message) or as dict keys (raw payload).
+    Truthy values (non-empty strings, lists, dicts) mean reasoning is
+    present; ``None`` / empty values mean it isn't.
+    """
+    if assistant_message is None:
+        return False
+
+    def _get(name):
+        if isinstance(assistant_message, dict):
+            return assistant_message.get(name)
+        value = getattr(assistant_message, name, None)
+        if value is None:
+            # OpenAI SDK exposes provider-extra fields via ``model_extra``.
+            model_extra = getattr(assistant_message, "model_extra", None)
+            if isinstance(model_extra, dict):
+                value = model_extra.get(name)
+        return value
+
+    return bool(_get("reasoning_content") or _get("reasoning"))
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -13911,10 +13944,25 @@ class AIAgent:
                                 re.IGNORECASE,
                             )
                         )
+                        # Detect parser-split reasoning (issue #21811): when
+                        # the upstream parser splits thinking into a separate
+                        # ``reasoning_content`` / ``reasoning`` channel, the
+                        # content field is empty AND has no <think> tag (the
+                        # parser already stripped it). Without this guard the
+                        # nudge fires even though the model produced complete
+                        # reasoning — the response just arrived in another
+                        # channel. Affects Ollama qwen3.x, DeepSeek-R1,
+                        # Moonshot, Novita, and any provider with a separate
+                        # reasoning field. Routes to the prefill path below
+                        # (which already handles structured reasoning).
+                        _has_separate_reasoning_channel = _has_separate_reasoning(
+                            assistant_message
+                        )
                         if (
                             _prior_was_tool
                             and not getattr(self, "_post_tool_empty_retried", False)
                             and not _has_inline_thinking  # thinking model still working — let prefill handle
+                            and not _has_separate_reasoning_channel  # #21811: parser-split reasoning
                         ):
                             self._post_tool_empty_retried = True
                             # Clear stale narration so it doesn't resurface
